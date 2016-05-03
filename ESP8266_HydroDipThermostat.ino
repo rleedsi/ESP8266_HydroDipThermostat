@@ -10,6 +10,7 @@
 // 2016May01 After building hardwired board and adding both temp sensors,
 //           the tank sensor shows up as index 1; modifying to support this -- RL
 // 2016May01 Adding ds2431 eeprom memory support -- RL
+// 2016May02 Added [Htg] indicator -- RL
 
 
 #include <Arduino.h>
@@ -22,8 +23,8 @@
 
 #define PROGNAME "Hydro dip thermostat"
 #define COPYRIGHT "Copyright (C) R.Lee"
-#define VERSION "0.8"
-#define VERDATE "2016May01"
+#define VERSION "0.81"
+#define VERDATE "2016May02"
 
 #define OUTPUTPIN 9 // 2016Feb16 write to pin 9 apparently crashing - trying swap of 9&10 - nope, won't even run with 9&10 swapped
 // 2016Feb19 Even ESP-12E won't support write to pins 9&10 without a hack - see
@@ -68,6 +69,10 @@
 // Status position
 #define STATUSX 110
 #define STATUSY 235
+#define HTGSTATUSX 275
+#define HTGSTATUSY 10
+#define HTGSTATUSW 35
+#define HTGSTATUSH 75
 
 // Arrows
 #define UPARROWX 145
@@ -224,7 +229,7 @@ bool findDS2431(byte *address)
 // =============================================
 // DS2431 utilities
 // =============================================
-void WriteReadScratchPad(byte *addr, byte TA1, byte TA2, byte *data)
+void writeReadScratchpad(byte *addr, byte TA1, byte TA2, byte *data)
 {
  int i;
  oneWire.reset();
@@ -242,9 +247,9 @@ void WriteReadScratchPad(byte *addr, byte TA1, byte TA2, byte *data)
  for ( i = 0; i < 13; i++)    
    data[i] = oneWire.read();
    
-} // WriteReadScratchPad()
+} // writeReadScratchpad()
 
-void CopyScratchPad(byte* addr, byte *data)
+void copyScratchpad(byte* addr, byte *data)
 {
  oneWire.reset();
  oneWire.select(addr);
@@ -255,15 +260,15 @@ void CopyScratchPad(byte* addr, byte *data)
  delay(25); // Waiting for copy completion
  //Serial.print("Copy done!\n");
  
-} // CopyScratchPad()
+} // copyScratchpad()
 
-void WriteRow(byte* addr, byte row, byte* buffer)
+void writeRow(byte* addr, byte row, byte* buffer)
 {
  int i;
  if (row < 0 || row > 15) // There are 16 rows of 8 bytes in the main memory
    return;                // The remaining are for the 64 bits register page
    
- WriteReadScratchPad(addr, row*8, 0x00, buffer);
+ writeReadScratchpad(addr, row*8, 0x00, buffer);
  
  //  Print result of the ReadScratchPad
  for ( i = 0; i < 13; i++)
@@ -272,11 +277,11 @@ void WriteRow(byte* addr, byte row, byte* buffer)
    Serial.print(" ");
  }
  //
- CopyScratchPad(addr, buffer);
+ copyScratchpad(addr, buffer);
  
-} // WriteRow()
+} // writeRow()
 
-void ReadRow(byte *addr, byte row, byte *buffer)
+void readRow(byte *addr, byte row, byte *buffer)
 {
   int i;
   unsigned int uRow = row;
@@ -295,7 +300,7 @@ void ReadRow(byte *addr, byte row, byte *buffer)
  }
  Serial.println();
 
-} // ReadRow()
+} // readRow()
 
 // updateEEPromValues()
 void updateEEPromValues()
@@ -304,7 +309,7 @@ void updateEEPromValues()
 
   *(float*)(&eeBuf[0]) = fIdleSetpoint;
   *(float*)(&eeBuf[4]) = fRunSetpoint;
-  WriteRow(ds2431, 0, eeBuf);
+  writeRow(ds2431, 0, eeBuf);
   
 } // updateEEPromValues()
 
@@ -483,6 +488,48 @@ void displayRunStatus(uint16_t x, uint16_t y)
   
 } // displayRunStatus()
 
+// displayHeatingStatus(bool bStatus)
+// bool bStatus: true = heating on; false (0) = heating off
+// Display current heating status
+void displayHeatingStatus(bool bStatus)
+{
+  if(bStatus)
+  {
+    ucg.setColor(255, 0, 0);  
+  }
+  else
+  {
+    ucg.setColor(0, 0, 0);
+  }
+  ucg.drawFrame(HTGSTATUSX, HTGSTATUSY, HTGSTATUSW, HTGSTATUSH);
+  ucg.setPrintPos(HTGSTATUSX+7, HTGSTATUSY+24);
+  ucg.print("H");
+  ucg.setPrintPos(HTGSTATUSX+11, HTGSTATUSY+44);
+  ucg.print("t");
+  ucg.setPrintPos(HTGSTATUSX+8, HTGSTATUSY+64);
+  ucg.print("g");
+    
+} // displayHeatingStatus()
+
+// heaterCtl(bool bRun)
+// bool bRun:
+//        true  = turn tank (and indicator) on
+//        false = turn tank (and indicator) off
+void
+heaterCtl(bool bRun)
+{
+    if(bRun)
+    {
+      digitalWrite(OUTPUTPIN, LOW);
+      displayHeatingStatus(true);
+    }
+    else
+    {
+      digitalWrite(OUTPUTPIN, HIGH);
+      displayHeatingStatus(false);
+    }
+  
+} // heaterCtl()
 // touchInRange() - Check if touch was in certain area
 // x, y = Touch point
 // sx, sy = Upper left bounding coordinates
@@ -544,7 +591,7 @@ void setup() {
   else
   {
     // read the setpoints from row zero of the eeprom
-    ReadRow(ds2431, /* row */0, dat);
+    readRow(ds2431, /* row */0, dat);
     fIdleSetpoint = *(float*)&dat[0];
     fRunSetpoint = *(float*)&dat[4];
     bEEPromRead = 1;
@@ -718,27 +765,27 @@ void loop() {
   {
     if(fTankTemp < (fRunSetpoint - TEMP_HYSTERESIS))
     {
-      digitalWrite(OUTPUTPIN, LOW);
+      heaterCtl(true);
     }
     else if(fTankTemp > (fRunSetpoint + TEMP_HYSTERESIS))
     {
-      digitalWrite(OUTPUTPIN, HIGH);
+      heaterCtl(false);
     }
   }
   else if(runMode == Idle)
   {
     if(fTankTemp < (fIdleSetpoint - TEMP_HYSTERESIS))
     {
-      digitalWrite(OUTPUTPIN, LOW);
+      heaterCtl(true);
     }
     else if(fTankTemp > (fIdleSetpoint + TEMP_HYSTERESIS))
     {
-      digitalWrite(OUTPUTPIN, HIGH);
+      heaterCtl(false);
     }
   }
   else // only one other state: Off
   {
-    digitalWrite(OUTPUTPIN, HIGH); // ensure controller stays off
+      heaterCtl(false);
 
   } // endupdate controller
 
