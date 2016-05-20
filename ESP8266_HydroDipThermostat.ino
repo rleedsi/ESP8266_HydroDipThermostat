@@ -11,6 +11,7 @@
 //           the tank sensor shows up as index 1; modifying to support this -- RL
 // 2016May01 Adding ds2431 eeprom memory support -- RL
 // 2016May02 Added [Htg] indicator -- RL
+// 2016May05-08 Adding support for time -- RL
 
 
 #include <Arduino.h>
@@ -22,9 +23,10 @@
 #include <XPT2046.h>
 
 #define PROGNAME "Hydro dip thermostat"
-#define COPYRIGHT "Copyright (C) R.Lee"
-#define VERSION "0.81"
-#define VERDATE "2016May02"
+#define COPYRIGHT "Copyright (C) 2016 R.Lee"
+#define VERSION "0.94"
+#define VERDATE "2016May14"
+#define DEBUG 1
 
 #define OUTPUTPIN 9 // 2016Feb16 write to pin 9 apparently crashing - trying swap of 9&10 - nope, won't even run with 9&10 swapped
 // 2016Feb19 Even ESP-12E won't support write to pins 9&10 without a hack - see
@@ -46,6 +48,7 @@
 // Button size
 #define BUTTONW 100
 #define BUTTONH 50
+
 // Main Screen
 #define RUNX 5
 #define RUNY 5
@@ -53,46 +56,49 @@
 #define IDLEY 65
 #define OFFX 5
 #define OFFY 125
-#define TIMEBX 5
-#define TIMEBY 185
 #define TEMPBX 5
 #define TEMPBY 185
 
 // Time Screen
-#define ONFORX 5
-#define ONFORY 5
-#define ONATX 5
-#define ONATY 65
-//#define TIMETEMPX 5
-//#define TIMETEMPY 125
-
-// Status position
-#define STATUSX 110
-#define STATUSY 235
-#define HTGSTATUSX 275
-#define HTGSTATUSY 10
-#define HTGSTATUSW 35
-#define HTGSTATUSH 75
+#define TIMEBX 5
+#define TIMEBY 185
 
 // Arrows
-#define UPARROWX 145
+#define UPARROWX 125
 #define UPARROWY 150
-#define DNARROWX 220
+#define DNARROWX 200
 #define DNARROWY 150
 #define ARROWW 30
 #define ARROWH 30
 
 // Temp & Setpoint
-#define TANKTEMPX 145
-#define TANKTEMPY 10
-#define AMBTEMPX 110
+#define TANKTEMPX 115
+#define TANKTEMPY 5
+#define AMBTEMPX 115
 #define AMBTEMPY 205
-#define SETPTX 145
+#define SETPTX 115
 #define SETPTY 80
 #define TANKTEMPW 120
 #define TANKTEMPH 60
 #define AMBTEMPW 150
 #define AMBTEMPH 50
+
+// Status position
+#define STATUSX 110
+#define STATUSY 235
+//#define HTGSTATUSX 275
+#define HTGSTATUSX 240
+#define HTGSTATUSY 5
+//#define HTGSTATUSW 35
+#define HTGSTATUSW 80
+//#define HTGSTATUSH 75
+#define HTGSTATUSH 40
+
+// Time remaining
+#define TIMEREMX 240
+#define TIMEREMY 50
+#define TIMEREMW 80
+#define TIMEREMH 90
 
 // Globals
 Ucglib_ILI9341_18x240x320_HWSPI ucg(/*cd=*/ 2 , /*cs=*/ 4, /*reset=*/ 5);
@@ -108,6 +114,9 @@ float fAmbientTemp;
 float fOffSetpoint;
 float fIdleSetpoint;
 float fRunSetpoint;
+float fRunTime;
+unsigned long ulRunStartTime;
+
 char szTemperature[40];
 byte tsTankAddr[8];     // address of 18b20 for tank
 byte tsAmbientAddr[8];  // address of 18b20 for ambient
@@ -118,14 +127,16 @@ enum runStates
 {
   Off,
   Idle,
+  Time,
   Run
 };
-runStates runMode;
+runStates runMode, lastRunMode, nextRunMode, tempRtnRunMode;
 
 // ftoa5()
 // Convert float to string with arbitrary precision, leading space padded to 5 chars min
 // (primarily for room temperatures)
-// 2016Feb07 Created -- RL
+// 2016Feb07 Created from example code from skumlerud
+//           (http://forum.arduino.cc/index.php?topic=44262.0) -- RL
 char *ftoa5(char *dest, double f, int precision)
 {
  long p[] = {0,10,100,1000,10000,100000,1000000,10000000,100000000};
@@ -228,6 +239,8 @@ bool findDS2431(byte *address)
 
 // =============================================
 // DS2431 utilities
+// From FredBiais, (http://forum.arduino.cc/index.php?topic=18198.0)
+// 2016Apr -- RL
 // =============================================
 void writeReadScratchpad(byte *addr, byte TA1, byte TA2, byte *data)
 {
@@ -273,8 +286,10 @@ void writeRow(byte* addr, byte row, byte* buffer)
  //  Print result of the ReadScratchPad
  for ( i = 0; i < 13; i++)
  {
+#ifdef DEBUG  
    Serial.print(buffer[i], HEX);
    Serial.print(" ");
+#endif   
  }
  //
  copyScratchpad(addr, buffer);
@@ -295,10 +310,14 @@ void readRow(byte *addr, byte row, byte *buffer)
   for ( i = 0; i < 8; i++) //whole mem is 144
   {
     buffer[i] = oneWire.read();
+#ifdef DEBUG    
     Serial.print(buffer[i], HEX);
     Serial.print(" ");
+#endif    
  }
+#ifdef DEBUG 
  Serial.println();
+#endif 
 
 } // readRow()
 
@@ -309,6 +328,7 @@ void updateEEPromValues()
 
   *(float*)(&eeBuf[0]) = fIdleSetpoint;
   *(float*)(&eeBuf[4]) = fRunSetpoint;
+  *(float*)(&eeBuf[8]) = fRunTime;
   writeRow(ds2431, 0, eeBuf);
   
 } // updateEEPromValues()
@@ -348,6 +368,10 @@ void drawTempButton()
 {
   drawButton(/*x*/TEMPBX, /*y*/TEMPBY, /*r*/0, /*g*/128, /*b*/255, /*text*/"Temp");
 }
+void drawReturnButton()
+{
+  drawButton(/*x*/TEMPBX, /*y*/TEMPBY, /*r*/0, /*g*/128, /*b*/255, /*text*/"Rtrn");
+}
 
 // drawButton()
 // x,y = Start coordinates
@@ -358,6 +382,7 @@ void drawButton(uint16_t x, uint16_t y, uint16_t r, uint16_t g, uint16_t b, char
   ucg.setColor(r, g, b);
   // drawFrame(x, y, w, h)
   ucg.drawFrame(x, y, BUTTONW, BUTTONH);
+  ucg.drawFrame(x+3, y+3, BUTTONW-6, BUTTONH-6);
   ucg.setPrintPos(x+15, y+30);
   ucg.print(text);
   
@@ -368,6 +393,7 @@ void drawUpArrow(uint16_t x, uint16_t y)
 {
   ucg.setColor(255, 0, 0);
   ucg.drawFrame(x, y, ARROWW, ARROWH);
+  ucg.drawFrame(x-3, y-3, ARROWW+6, ARROWH+6);
   ucg.drawTriangle(x+2,y+ARROWH-2, x+15,y+2, x+ARROWW-2,y+30-2);
   
 } // drawUpArrow()
@@ -376,6 +402,7 @@ void drawDownArrow(uint16_t x, uint16_t y)
 {
   ucg.setColor(0, 0, 255);
   ucg.drawFrame(x, y, ARROWW, ARROWH);
+  ucg.drawFrame(x-3, y-3, ARROWW+6, ARROWH+6);
   ucg.drawTriangle(x+2,y+2, x+ARROWW-2,y+2, x+15,y+ARROWH-2);
   
 } // drawDownArrow()
@@ -398,14 +425,13 @@ void displayTankTemp(uint16_t x, uint16_t y, float temperature)
 
 // displayAmbientTemp(x, y, temperature)
 // uint16_t x,y: Upper left coordinates of value
-// float temperature: the value to display
+// float temperature: The value to display
 void displayAmbientTemp(uint16_t x, uint16_t y, float temperature)
 {
   static int iDisplayCount=0;
   char szTemp[40];
 
   ftoa5(szTemp, temperature, 1);
-
   if(iDisplayCount == 0)          // Display everything on first pass
   {
     iDisplayCount++;
@@ -415,10 +441,12 @@ void displayAmbientTemp(uint16_t x, uint16_t y, float temperature)
     ucg.setPrintPos(x+125, y);
     ucg.print(szTemp);
   }
-  else if(iDisplayCount++ == 10)  // then on every n cycles, display the heading as well
+  else if(iDisplayCount++ == 4)   // On every n cycles, clear the data area and display the heading as well
   {
     iDisplayCount = 0;
 //    ucg.drawBox(x+125, y-20, 85, 25);
+    ucg.setColor(0, 0, 0);
+    ucg.drawBox(x+130, y-20, 70, 22);
     ucg.setColor(0, 255, 255);
     ucg.setPrintPos(x, y);
     ucg.print("Ambient:");
@@ -474,6 +502,10 @@ void displayRunStatus(uint16_t x, uint16_t y)
       ucg.setColor(0, 255, 0);
       strcpy(msg, "Idling");
       break;
+    case Time:
+      ucg.setColor(255, 255, 255);
+      strcpy(msg, "Set Time");
+      break;      
     default:
       ucg.setColor(0, 0, 255); 
       strcpy(msg, "Off");
@@ -484,8 +516,9 @@ void displayRunStatus(uint16_t x, uint16_t y)
   ucg.print("Mode:");
   ucg.setPrintPos(x+82, y);
   ucg.print(msg);
+#ifdef DEBUG  
   Serial.println(msg);
-  
+#endif  
 } // displayRunStatus()
 
 // displayHeatingStatus(bool bStatus)
@@ -495,21 +528,68 @@ void displayHeatingStatus(bool bStatus)
 {
   if(bStatus)
   {
-    ucg.setColor(255, 0, 0);  
+    ucg.setColor(255, 0, 0);
   }
   else
   {
     ucg.setColor(0, 0, 0);
   }
   ucg.drawFrame(HTGSTATUSX, HTGSTATUSY, HTGSTATUSW, HTGSTATUSH);
-  ucg.setPrintPos(HTGSTATUSX+7, HTGSTATUSY+24);
-  ucg.print("H");
-  ucg.setPrintPos(HTGSTATUSX+11, HTGSTATUSY+44);
-  ucg.print("t");
-  ucg.setPrintPos(HTGSTATUSX+8, HTGSTATUSY+64);
-  ucg.print("g");
-    
+  ucg.setPrintPos(HTGSTATUSX+15, HTGSTATUSY+30);
+  ucg.print("Htg");
+
 } // displayHeatingStatus()
+
+// displayTimeRemaining(bool bDisplay, float fTimeRem)
+// Display current time remaining
+// bool bDisplay: true to display, false to clear this indication
+// float fTimeRem: run time remaining
+void displayTimeRemaining(bool bDisplay, float fTimeRem)
+{
+  // calculate minutes/hours left, convert to float, store in string, and print
+//  unsigned long ulMS;
+//  ulMS = millis();
+//  ulTimeRem = ulMS - (ulRunStartTime + (unsigned long)(fRunTime * 60 * 60));
+//  float fTimeRem = fRunTime - (float)(((ulMS - ulRunStartTime) * 1000) * 60);
+// Convert run time to minutes
+//  float fTimeRem = (float)((float)ulRunStartTime + fRunTime * 1000.0 * 60.0 - ulMS  / 1000.0 );
+//   ulMS - ulRunTime = ms of run time
+//   /1000 = s of run time
+//   /60 = m of run time
+//   runtime (m) * 60 = runtime (s)
+//   
+//  float fTimeRem = fRunTime - (float)(((ulMS - ulRunStartTime) / 1000.0) / 60.0);
+#ifdef DEBUG
+  Serial.println("Time remaining update");
+  Serial.print("Time remaining: ");
+  Serial.println(fTimeRem);
+#endif  
+  char tmp[40];
+
+  if(bDisplay)
+  {
+    ucg.setColor(0, 255, 255);
+  }
+  else
+  {
+    ucg.setColor(0, 0, 0);
+  }
+  ucg.drawFrame(TIMEREMX, TIMEREMY, TIMEREMW, TIMEREMH);
+  ucg.setPrintPos(TIMEREMX+5, TIMEREMY+30);
+  ucg.print("Hrs");
+  ucg.setPrintPos(TIMEREMX+5, TIMEREMY+55);
+  ucg.print("Rmn");
+  ucg.setPrintPos(TIMEREMX+5, TIMEREMY+80);
+  ucg.setColor(0, 0, 0);
+  ucg.drawBox(TIMEREMX+5, TIMEREMY+60, TIMEREMW-20, 28);
+  if(bDisplay)
+  {
+    ucg.setColor(0, 255, 255);
+    ucg.print(ftoa5(tmp, fTimeRem, 2));
+  }
+    
+} // displayTimeRemaining()
+
 
 // heaterCtl(bool bRun)
 // bool bRun:
@@ -530,6 +610,8 @@ heaterCtl(bool bRun)
     }
   
 } // heaterCtl()
+
+
 // touchInRange() - Check if touch was in certain area
 // x, y = Touch point
 // sx, sy = Upper left bounding coordinates
@@ -586,7 +668,7 @@ void setup() {
   if(!findDS2431(ds2431))
   {
     Serial.println("No DS2431 EEPROM found!");
-    fRunSetpoint = 70.0;
+//    fRunSetpoint = 70.0;
   }
   else
   {
@@ -594,6 +676,8 @@ void setup() {
     readRow(ds2431, /* row */0, dat);
     fIdleSetpoint = *(float*)&dat[0];
     fRunSetpoint = *(float*)&dat[4];
+//    fRunTime = *(float*)&dat[8];
+fRunTime = 2.0;
     bEEPromRead = 1;
   }
 
@@ -602,8 +686,12 @@ void setup() {
     fRunSetpoint = 70.0;
     fIdleSetpoint = 45.0;
     fOffSetpoint = 0.0;
+    fRunTime = 3.0;
   }
   runMode = Off;
+  lastRunMode = Off;
+  tempRtnRunMode = Off;
+  nextRunMode = Off;
   bSpUpd = 0;
 
   drawTempScreen();
@@ -647,7 +735,8 @@ void drawTimeScreen()
   drawRunButton();
   drawIdleButton();
   drawOffButton();
-  drawTempButton();
+  drawReturnButton();
+  displaySetpoint(SETPTX, SETPTY, fRunTime);
   drawUpArrow(UPARROWX, UPARROWY);
   drawDownArrow(DNARROWX, DNARROWY);
 
@@ -658,29 +747,34 @@ void drawTimeScreen()
 //********************* loop() *********************
 void loop() {
   static float fTankTemp;
+  float fTimeRem;
   static unsigned long ulMSBtnPress;
   uint16_t x, y;
   unsigned long ulMS;
   byte eeDat[13];
   
+  // See if we have any user interface updates
   if(touch.isTouching())
   {
     bSpUpd = 0;
     touch.getPosition(x, y);
+#ifdef DEBUG    
     Serial.print("x,y=");
     Serial.print(x);
     Serial.print(",");
     Serial.print(y);
     Serial.printf("\n");
+#endif    
     if(touchInRange(x, y, RUNX, RUNY, BUTTONW, BUTTONH)) // Run
     {
-      ulMSBtnPress = millis();        // set base timer to trigger subsequent write to eeprom 
       if(runMode != Run)
       {
-//        digitalWrite(OUTPUTPIN, LOW);
+#ifdef DEBUG        
         Serial.println("Shifting to run");
+#endif        
         runMode = Run;
-        drawTempScreen();
+        ulRunStartTime = millis();          // Start timing
+//        drawTempScreen();
       }
     }
     else if(touchInRange(x, y, IDLEX, IDLEY, BUTTONW, BUTTONH)) // Idle
@@ -688,14 +782,24 @@ void loop() {
       if(runMode != Idle) 
       {
         runMode = Idle;
-        drawTempScreen();
+      }
+    }
+    else if(touchInRange(x, y, TIMEBX, TIMEBY, BUTTONW, BUTTONH)) // Time/Return
+    {
+      if(runMode != Time) 
+      {
+        tempRtnRunMode = runMode; // Save current mode to return to later
+        runMode = Time;
+      }
+      else
+      {
+        runMode = tempRtnRunMode;
       }
     }
     else if(touchInRange(x, y, OFFX, OFFY, BUTTONW, BUTTONH)) // Off
     {
       digitalWrite(OUTPUTPIN, HIGH);
       runMode = Off;
-      drawTempScreen();
     }
     else if(touchInRange(x, y, UPARROWY, UPARROWY, ARROWW, ARROWH)) // Up arrow
     {
@@ -708,6 +812,9 @@ void loop() {
         case Idle:
           fIdleSetpoint += 1.0;
           break;
+        case Time:
+          fRunTime += 1.0;
+          break;
         default:
           break;
       }
@@ -718,11 +825,14 @@ void loop() {
       ulMSBtnPress = millis();        // set base timer to trigger subsequent write to eeprom 
       switch(runMode)
       {
-        case Run:     displaySetpoint(SETPTX, SETPTY, fOffSetpoint);
+        case Run:
           fRunSetpoint -= 1.0;
           break;
         case Idle:
           fIdleSetpoint -= 1.0;
+          break;
+        case Time:
+          fRunTime -= 1.0;
           break;
         default:
           break;
@@ -730,10 +840,29 @@ void loop() {
       bSpUpd = 1;
     }
     
-    displayRunStatus(STATUSX, STATUSY);
+//    displayRunStatus(STATUSX, STATUSY);
     
   } // end if touching
+  
+  // Grab current ms value for several calculations
+  ulMS = millis();
 
+  // Check to see if it is time to shift to idle
+  if(runMode == Run && lastRunMode == Run)
+  {
+    fTimeRem = fRunTime - (float)(((ulMS - ulRunStartTime) / 1000.0) / 60.0);
+    displayTimeRemaining(true, fTimeRem);
+    if(fTimeRem <= 0)
+    {
+      runMode = Idle;
+    }
+  }
+  // If this is the first 'off' pass, clear the time remaining indicator
+  if(runMode == Off && lastRunMode == Run)
+  {
+    displayTimeRemaining(false, fTimeRem);
+  }
+  
   // Process temperature
   // Tank temp
   fTankTemp = readTemp(tsTankAddr);
@@ -743,63 +872,103 @@ void loop() {
   fAmbientTemp = readTemp(tsAmbientAddr);
   displayAmbientTemp(AMBTEMPX, AMBTEMPY, fAmbientTemp);
 
+  // Update screen for mode changes
+  if(runMode != lastRunMode)
+  {
+    switch(runMode)
+    {
+      case Run:
+      case Idle:
+      case Off:
+        drawTempScreen();
+        break;
+        
+      case Time:
+        drawTimeScreen();
+        break;
+    }
+  } // end mode change screen update
+  
   // If setpt changed, redisplay it
   if(bSpUpd)
   {
-    if(runMode == Idle)
+    switch(runMode)
     {
-      displaySetpoint(SETPTX, SETPTY, fIdleSetpoint);
-      bSpUpd = 0;
-      Serial.println(fIdleSetpoint);
+      case Run:
+        displaySetpoint(SETPTX, SETPTY, fRunSetpoint);
+#ifdef DEBUG        
+        Serial.println(fRunSetpoint);
+#endif        
+        break;
+      case Idle:
+        displaySetpoint(SETPTX, SETPTY, fIdleSetpoint);
+#ifdef DEBUG        
+        Serial.println(fIdleSetpoint);
+#endif        
+        break;
+      case Time:
+        displaySetpoint(SETPTX, SETPTY, fRunTime);
+#ifdef DEBUG        
+        Serial.println(fRunTime);
+#endif        
+        break;
     }
-    else if(runMode == Run)
-    {
-      displaySetpoint(SETPTX, SETPTY, fRunSetpoint);
-      bSpUpd = 0;
-      Serial.println(fRunSetpoint);
-    }
+        bSpUpd = 0;
+        
+  } // endif a setpoint was updated
+
+
+ // Update controller
+  switch(runMode)
+  {
+    case Run:
+      if(fTankTemp < (fRunSetpoint - TEMP_HYSTERESIS))
+      {
+        heaterCtl(true);
+      }
+      else if(fTankTemp > (fRunSetpoint + TEMP_HYSTERESIS))
+      {
+        heaterCtl(false);
+      }
+      break;
+    case Idle:
+      if(fTankTemp < (fIdleSetpoint - TEMP_HYSTERESIS))
+      {
+        heaterCtl(true);
+      }
+      else if(fTankTemp > (fIdleSetpoint + TEMP_HYSTERESIS))
+      {
+        heaterCtl(false);
+      }
+      break;
+      
+    case Time:
+      // Turn heater off for now
+      heaterCtl(false);
+      break;
+
+    default:               // Only one other state: Off
+      heaterCtl(false);
+      break;
   }
 
-  // Update controller
-  if(runMode == Run)
-  {
-    if(fTankTemp < (fRunSetpoint - TEMP_HYSTERESIS))
-    {
-      heaterCtl(true);
-    }
-    else if(fTankTemp > (fRunSetpoint + TEMP_HYSTERESIS))
-    {
-      heaterCtl(false);
-    }
-  }
-  else if(runMode == Idle)
-  {
-    if(fTankTemp < (fIdleSetpoint - TEMP_HYSTERESIS))
-    {
-      heaterCtl(true);
-    }
-    else if(fTankTemp > (fIdleSetpoint + TEMP_HYSTERESIS))
-    {
-      heaterCtl(false);
-    }
-  }
-  else // only one other state: Off
-  {
-      heaterCtl(false);
-
-  } // endupdate controller
-
+  
   // Check and write eeprom if values have changed
   // Main loop runs at about 1/sec with overhead, so we're looking for the window
   // between 10S minus 2S (8000 mS) and 10S plus 2S (12000 mS) to write in
-  ulMS = millis();
   // Serial.print(ulMSBtnPress); Serial.print(" "); Serial.println(ulMS);
   if(ulMS >= (ulMSBtnPress + 8000) && ulMS <= (ulMSBtnPress + 12000))
   {
     updateEEPromValues();
+#ifdef DEBUG    
     Serial.println("Updating eeprom");
+#endif    
   }
 
+  
+  // Update lastRunMode for next pass
+  lastRunMode = runMode;
+  
   delay(20);
  
 } // loop()
